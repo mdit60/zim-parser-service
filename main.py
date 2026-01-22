@@ -2,12 +2,13 @@
 ZIM PDF Parser Microservice
 FastAPI-basierter Service zum Parsen von ZIM-Foerderantraegen (XFA-PDFs)
 
-VERSION: 3.0 - 22. Januar 2026
+VERSION: 3.1 - 22. Januar 2026
 FEATURES:
 - Unterstuetzt Standard-ZIM-Antraege (Einzelprojekt, Kooperation)
 - Unterstuetzt Durchfuehrbarkeitsstudien (Antrag_DS)
+- Extrahiert Mitarbeiter aus Anlage 6.1
+- Extrahiert MA-Zuordnungen zu Arbeitspaketen
 - UTF-8 Encoding korrekt
-- AP-Nummern wie "1.1", "1.2" werden unterstuetzt
 
 Deployment: Railway.app
 """
@@ -29,10 +30,10 @@ except ImportError:
 app = FastAPI(
     title="ZIM PDF Parser",
     description="Parst ZIM-Foerderantraege (XFA-PDFs) und extrahiert strukturierte Daten",
-    version="3.0.0"
+    version="3.1.0"
 )
 
-# CORS fuer Zugriff von deiner Next.js App
+# CORS fuer Zugriff von Next.js App
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -90,18 +91,18 @@ def extract_all_values(tag_name: str, text: str) -> list:
 
 
 def parse_ap_nummer(lfd: str) -> tuple:
-    """Parst AP-Nummern wie "1", "1.1", "2", "2.1" etc."""
+    """Parst AP-Nummern wie '1', '1.1', '2', '2.1' etc."""
     if not lfd:
         return (0, 0)
-    lfd = lfd.strip().rstrip('.')
+    lfd = str(lfd).strip().rstrip('.')
     if '.' in lfd:
         parts = lfd.split('.')
         try:
-            return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+            return (int(parts[0]), int(parts[1]) if len(parts) > 1 and parts[1] else 0)
         except:
             return (0, 0)
     try:
-        return (int(lfd), 0)
+        return (int(float(lfd)), 0)
     except:
         return (0, 0)
 
@@ -116,12 +117,359 @@ def detect_format(xfa_text: str) -> str:
         return 'unbekannt'
 
 
+def parse_german_date(date_str: str) -> str:
+    """Konvertiert deutsches Datum (DD.MM.YYYY) zu ISO (YYYY-MM-DD)"""
+    if not date_str:
+        return ''
+    date_str = date_str.strip()
+    # Bereits ISO-Format?
+    if re.match(r'^\d{4}-\d{2}-\d{2}', date_str):
+        return date_str[:10]
+    # Deutsches Format?
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})', date_str)
+    if match:
+        return f"{match.group(3)}-{match.group(2).zfill(2)}-{match.group(1).zfill(2)}"
+    return date_str
+
+
+# ============================================
+# MITARBEITER EXTRAKTION (Anlage 6.1)
+# ============================================
+
+def extract_mitarbeiter_ds(xfa_text: str) -> list:
+    """Extrahiert Mitarbeiter aus Durchfuehrbarkeitsstudie (Page11 Bloecke)"""
+    mitarbeiter = []
+    
+    # Finde alle Page11 Bloecke (jeder Block = ein Mitarbeiter)
+    page11_blocks = re.findall(r'<Page11>(.*?)</Page11>', xfa_text, re.DOTALL)
+    
+    print(f"  Gefundene Page11-Bloecke: {len(page11_blocks)}")
+    
+    for idx, block in enumerate(page11_blocks):
+        # Nur Bloecke mit lfd (Mitarbeiternummer) verarbeiten
+        if '<lfd>' not in block:
+            continue
+            
+        lfd = extract_value(r'<lfd>([^<]+)</lfd>', block)
+        name = extract_value(r'<name>([^<]+)</name>', block)
+        vname = extract_value(r'<vname>([^<]+)</vname>', block)
+        
+        # Leere Eintraege ueberspringen
+        if not name or not vname:
+            continue
+        
+        # Geburtsdatum (verschiedene Feldnamen moeglich)
+        geb = extract_value(r'<geb_gf>([^<]+)</geb_gf>', block)
+        if not geb:
+            geb = extract_value(r'<geb>([^<]+)</geb>', block)
+        
+        ma = {
+            'ma_nr': int(float(lfd)) if lfd else idx + 1,
+            'nachname': name,
+            'vorname': vname,
+            'name_komplett': f"{vname} {name}",
+            'geburtsdatum': parse_german_date(geb),
+            'qualifikation': extract_value(r'<quali>([^<]+)</quali>', block),
+            'funktion': extract_value(r'<als>([^<]+)</als>', block) or extract_value(r'<statisch><als>([^<]+)</als>', block),
+            'angestellt_seit': parse_german_date(extract_value(r'<ang_seit>([^<]+)</ang_seit>', block)),
+            'wochenstunden': parse_float_value(extract_value(r'<wo_std>([^<]+)</wo_std>', block)),
+            'jahresbrutto': parse_float_value(extract_value(r'<jahresbrutto>([^<]+)</jahresbrutto>', block)),
+            'monatsbrutto': parse_float_value(extract_value(r'<monats_brutto>([^<]+)</monats_brutto>', block)),
+            'stundensatz': parse_float_value(extract_value(r'<std_satz>([^<]+)</std_satz>', block)),
+            'teilzeitfaktor': parse_float_value(extract_value(r'<tz_faktor>([^<]+)</tz_faktor>', block)) or 1.0,
+        }
+        
+        # Berechne fehlende Werte
+        if ma['jahresbrutto'] > 0 and ma['stundensatz'] == 0 and ma['wochenstunden'] > 0:
+            jahresstunden = ma['wochenstunden'] * 52
+            ma['stundensatz'] = round(ma['jahresbrutto'] / jahresstunden, 2)
+        
+        if ma['monatsbrutto'] == 0 and ma['jahresbrutto'] > 0:
+            ma['monatsbrutto'] = round(ma['jahresbrutto'] / 12, 2)
+        
+        mitarbeiter.append(ma)
+        print(f"    MA {ma['ma_nr']}: {ma['name_komplett']} - {ma['qualifikation']} - {ma['stundensatz']} EUR/h")
+    
+    return mitarbeiter
+
+
+# ============================================
+# MA-ZUORDNUNGEN EXTRAKTION (Anlage 5 / Page10)
+# ============================================
+
+def extract_ma_zuordnungen_ds(xfa_text: str) -> dict:
+    """
+    Extrahiert MA-Zuordnungen zu Arbeitspaketen aus Page10.
+    Gibt ein Dict zurueck: {ap_code: [(ma_nr, pm), ...]}
+    """
+    zuordnungen = {}
+    
+    # Nicht-technische APs: <MA_10B>, <AP_10B>, <pm_10B>
+    # Format: <MA_10B>1</MA_10B><pm_10B>1.5</pm_10B><AP_10B>1;3;</AP_10B>
+    ma_blocks = re.findall(
+        r'<MA_10B>([^<]*)</MA_10B>.*?<pm_10B>([^<]*)</pm_10B>.*?<AP_10B>([^<]*)</AP_10B>',
+        xfa_text, re.DOTALL
+    )
+    
+    print(f"  Nicht-technische MA-Zuordnungen: {len(ma_blocks)}")
+    
+    for ma_nr, pm_gesamt, aps in ma_blocks:
+        ma_nr = int(float(ma_nr)) if ma_nr else 0
+        if ma_nr == 0:
+            continue
+            
+        # APs sind semicolon-separiert: "1;3;"
+        ap_list = [ap.strip() for ap in aps.split(';') if ap.strip()]
+        
+        # PM gleichmaessig auf APs verteilen (vereinfacht)
+        pm_total = parse_float_value(pm_gesamt)
+        pm_per_ap = pm_total / len(ap_list) if ap_list else 0
+        
+        for ap in ap_list:
+            ap_code = f"AP{ap}"
+            if ap_code not in zuordnungen:
+                zuordnungen[ap_code] = []
+            zuordnungen[ap_code].append({
+                'ma_nr': ma_nr,
+                'pm': round(pm_per_ap, 2)
+            })
+    
+    # Technische APs: <MA_10B_techn>, <AP_10B_techn>, <pm_10B_techn>
+    ma_blocks_tech = re.findall(
+        r'<MA_10B_techn>([^<]*)</MA_10B_techn>.*?<pm_10B_techn>([^<]*)</pm_10B_techn>.*?<AP_10B_techn>([^<]*)</AP_10B_techn>',
+        xfa_text, re.DOTALL
+    )
+    
+    print(f"  Technische MA-Zuordnungen: {len(ma_blocks_tech)}")
+    
+    for ma_nr, pm_gesamt, aps in ma_blocks_tech:
+        ma_nr = int(float(ma_nr)) if ma_nr else 0
+        if ma_nr == 0:
+            continue
+            
+        ap_list = [ap.strip().rstrip('.') for ap in aps.split(';') if ap.strip()]
+        pm_total = parse_float_value(pm_gesamt)
+        pm_per_ap = pm_total / len(ap_list) if ap_list else 0
+        
+        for ap in ap_list:
+            ap_code = f"AP{ap}"
+            if ap_code not in zuordnungen:
+                zuordnungen[ap_code] = []
+            zuordnungen[ap_code].append({
+                'ma_nr': ma_nr,
+                'pm': round(pm_per_ap, 2)
+            })
+    
+    # Alternative: Direkte Zuordnungen aus Zeile2 (Anlage 5)
+    # <Arbeitspaket_Nr>1</Arbeitspaket_Nr>...<MA_Nr>1.00</MA_Nr><pm>0.500</pm>
+    zeile_matches = re.findall(
+        r'<Arbeitspaket_Nr>([^<]*)</Arbeitspaket_Nr>.*?<MA_Nr>([^<]*)</MA_Nr>.*?<pm>([^<]*)</pm>',
+        xfa_text, re.DOTALL
+    )
+    
+    if zeile_matches and not zuordnungen:
+        print(f"  Direkte AP-Zuordnungen aus Anlage 5: {len(zeile_matches)}")
+        for ap_nr, ma_nr, pm in zeile_matches:
+            ap_code = f"AP{ap_nr.strip()}"
+            ma = int(float(ma_nr)) if ma_nr else 0
+            if ma == 0:
+                continue
+            if ap_code not in zuordnungen:
+                zuordnungen[ap_code] = []
+            zuordnungen[ap_code].append({
+                'ma_nr': ma,
+                'pm': parse_float_value(pm)
+            })
+    
+    return zuordnungen
+
+
+# ============================================
+# PARSER: DURCHFUEHRBARKEITSSTUDIE
+# ============================================
+
+def parse_durchfuehrbarkeitsstudie(xfa_text: str, filename: str) -> dict:
+    """Parser fuer Durchfuehrbarkeitsstudien (Antrag_DS)"""
+    
+    print("  Parsing Durchfuehrbarkeitsstudie...")
+    
+    # Zeilenumbrueche normalisieren
+    text = xfa_text.replace('\n>', '>').replace('>\n', '>')
+    
+    # Projekt-Stammdaten
+    projekt = {
+        'name': extract_value(r'<thema>([^<]+)', text),
+        'kurzname': '',
+        'fkz': '',
+        'start': extract_value(r'<Laufzeit[^>]*>.*?<von>([^<]+)</von>', text) or 
+                 extract_value(r'Laufzeit.*?von.*?(\d{2}\.\d{2}\.\d{4})', text),
+        'ende': extract_value(r'<Laufzeit[^>]*>.*?<bis>([^<]+)</bis>', text) or
+                extract_value(r'Laufzeit.*?bis.*?(\d{2}\.\d{2}\.\d{4})', text),
+        'foerderquote': extract_float(r'<foerdersatz[^>]*>([^<]+)', text) or 50.0,
+        'gesamtkosten': extract_float(r'<sum_ges_pk>([^<]+)', text),
+        'zuwendung': extract_float(r'<Zuwendung[^>]*>([^<]+)', text),
+        'gesamt_pm': 0.0,
+        'gesamt_pk': extract_float(r'<sum_ges_pk>([^<]+)', text),
+        'laufzeit_monate': 0
+    }
+    
+    # Kurzfassung als Kurzname
+    kurzfass = extract_value(r'<kurzfass>([^<]+)', text)
+    if kurzfass:
+        projekt['kurzname'] = kurzfass[:100] + '...' if len(kurzfass) > 100 else kurzfass
+    
+    # Laufzeit berechnen
+    if projekt['start'] and projekt['ende']:
+        start_date = parse_german_date(projekt['start'])
+        end_date = parse_german_date(projekt['ende'])
+        projekt['start'] = start_date
+        projekt['ende'] = end_date
+        try:
+            if start_date and end_date:
+                s_parts = start_date.split('-')
+                e_parts = end_date.split('-')
+                s_year, s_month = int(s_parts[0]), int(s_parts[1])
+                e_year, e_month = int(e_parts[0]), int(e_parts[1])
+                projekt['laufzeit_monate'] = (e_year - s_year) * 12 + (e_month - s_month) + 1
+        except:
+            pass
+    
+    # Antragsteller
+    antragsteller = {
+        'firma': extract_value(r'<Antragsteller>([^<]+)', text) or '',
+        'rechtsform': extract_value(r'<Rechtsform>([^<]+)', text),
+        'strasse': extract_value(r'<str>([^<]+)', text),
+        'plz': extract_value(r'<plz>([^<]+)', text),
+        'ort': extract_value(r'<ort>([^<]+)', text),
+        'bundesland': extract_value(r'<ddl_land>([^<]+)', text),
+        'website': extract_value(r'<www>([^<]+)', text),
+        'ansprechpartner_name': f"{extract_value(r'<vname_ap>([^<]+)', text)} {extract_value(r'<name_ap>([^<]+)', text)}".strip(),
+        'ansprechpartner_funktion': '',
+        'ansprechpartner_telefon': extract_value(r'<tel_ap>([^<]+)', text),
+        'ansprechpartner_email': extract_value(r'<mail_ap>([^<]+)', text),
+    }
+    
+    # Firma aus Website ableiten wenn leer
+    if not antragsteller['firma'] and antragsteller['website']:
+        domain = antragsteller['website'].replace('www.', '').split('.')[0]
+        antragsteller['firma'] = domain.capitalize() + ' GmbH'
+    
+    # ========== MITARBEITER ==========
+    print("  Extrahiere Mitarbeiter...")
+    mitarbeiter = extract_mitarbeiter_ds(text)
+    print(f"  {len(mitarbeiter)} Mitarbeiter gefunden")
+    
+    # ========== MA-ZUORDNUNGEN ==========
+    print("  Extrahiere MA-Zuordnungen...")
+    ma_zuordnungen = extract_ma_zuordnungen_ds(text)
+    print(f"  Zuordnungen fuer {len(ma_zuordnungen)} APs gefunden")
+    
+    # ========== ARBEITSPAKETE ==========
+    arbeitspakete = []
+    
+    # Nicht-technische APs
+    ap_nrs = extract_all_values('Arbeitspaket_Nr', text)
+    ap_names = extract_all_values('Arbeitspaket', text)
+    ap_pms = extract_all_values('pm', text)
+    ap_von = extract_all_values('RealisierungVON', text)
+    ap_bis = extract_all_values('RealisierungBIS', text)
+    
+    print(f"  Nicht-techn. APs: {len(ap_nrs)} Nr, {len(ap_names)} Namen")
+    
+    for i in range(max(len(ap_nrs), len(ap_names))):
+        ap_nr_str = ap_nrs[i] if i < len(ap_nrs) else str(i + 1)
+        ap_name = ap_names[i] if i < len(ap_names) else ''
+        pm_str = ap_pms[i] if i < len(ap_pms) else '0'
+        von = ap_von[i] if i < len(ap_von) else ''
+        bis = ap_bis[i] if i < len(ap_bis) else ''
+        
+        if ap_name and len(ap_name) > 2:
+            haupt, unter = parse_ap_nummer(ap_nr_str)
+            if haupt == 0:
+                haupt = i + 1
+            
+            pm = parse_float_value(pm_str)
+            ap_code = f"AP{ap_nr_str.strip()}"
+            
+            # MA-Zuordnungen fuer dieses AP
+            ap_zuordnungen = ma_zuordnungen.get(ap_code, [])
+            
+            arbeitspakete.append({
+                'ap_nummer': haupt,
+                'ap_sub_nummer': unter,
+                'ap_code': ap_code,
+                'name': ap_name,
+                'start_datum': parse_german_date(von),
+                'ende_datum': parse_german_date(bis),
+                'start_monat': None,
+                'ende_monat': None,
+                'gesamt_pm': pm,
+                'is_technical': False,
+                'mitarbeiter_zuordnungen': ap_zuordnungen
+            })
+            
+            projekt['gesamt_pm'] += pm
+    
+    # Technische APs
+    ap_nrs_tech = extract_all_values('Arbeitspaket_Nr_techn', text)
+    ap_names_tech = extract_all_values('Arbeitspaket_techn', text)
+    ap_pms_tech = extract_all_values('pm_techn', text)
+    
+    print(f"  Technische APs: {len(ap_nrs_tech)} Nr, {len(ap_names_tech)} Namen")
+    
+    for i in range(max(len(ap_nrs_tech), len(ap_names_tech))):
+        ap_nr_str = ap_nrs_tech[i] if i < len(ap_nrs_tech) else ''
+        ap_name = ap_names_tech[i] if i < len(ap_names_tech) else ''
+        pm_str = ap_pms_tech[i] if i < len(ap_pms_tech) else '0'
+        
+        if ap_name and len(ap_name) > 2 and ap_nr_str:
+            clean_nr = ap_nr_str.rstrip('.')
+            haupt, unter = parse_ap_nummer(clean_nr)
+            
+            # Pruefe ob AP schon existiert
+            ap_code = f"AP{clean_nr}"
+            exists = any(ap['ap_code'] == ap_code for ap in arbeitspakete)
+            
+            if not exists and haupt > 0:
+                pm = parse_float_value(pm_str)
+                ap_zuordnungen = ma_zuordnungen.get(ap_code, [])
+                
+                arbeitspakete.append({
+                    'ap_nummer': haupt,
+                    'ap_sub_nummer': unter,
+                    'ap_code': ap_code,
+                    'name': ap_name,
+                    'start_datum': None,
+                    'ende_datum': None,
+                    'start_monat': None,
+                    'ende_monat': None,
+                    'gesamt_pm': pm,
+                    'is_technical': True,
+                    'mitarbeiter_zuordnungen': ap_zuordnungen
+                })
+                
+                projekt['gesamt_pm'] += pm
+    
+    # Sortieren nach AP-Nummer
+    arbeitspakete.sort(key=lambda ap: (ap['ap_nummer'], ap['ap_sub_nummer'] or 0))
+    
+    return {
+        'projekt': projekt,
+        'antragsteller': antragsteller,
+        'mitarbeiter': mitarbeiter,
+        'arbeitspakete': arbeitspakete,
+        'format': 'durchfuehrbarkeitsstudie'
+    }
+
+
 # ============================================
 # PARSER: STANDARD ZIM
 # ============================================
 
 def parse_standard_zim(xfa_text: str, filename: str) -> dict:
-    """Parser fuer Standard-ZIM-Antraege"""
+    """Parser fuer Standard-ZIM-Antraege (Einzelprojekt, Kooperation)"""
+    
+    print("  Parsing Standard-ZIM...")
     
     # Projekt
     projekt = {
@@ -138,23 +486,6 @@ def parse_standard_zim(xfa_text: str, filename: str) -> dict:
         'laufzeit_monate': 0
     }
     
-    # Laufzeit berechnen
-    if projekt['start'] and projekt['ende']:
-        try:
-            if '-' in projekt['start']:
-                start_parts = projekt['start'].split('-')
-                end_parts = projekt['ende'].split('-')
-                start_year, start_month = int(start_parts[0]), int(start_parts[1])
-                end_year, end_month = int(end_parts[0]), int(end_parts[1])
-            else:
-                start_parts = projekt['start'].split('.')
-                end_parts = projekt['ende'].split('.')
-                start_year, start_month = int(start_parts[2]), int(start_parts[1])
-                end_year, end_month = int(end_parts[2]), int(end_parts[1])
-            projekt['laufzeit_monate'] = (end_year - start_year) * 12 + (end_month - start_month) + 1
-        except:
-            pass
-    
     # Antragsteller
     antragsteller = {
         'firma': extract_value(r'<cg_VMS_firma>([^<]+)', xfa_text),
@@ -170,10 +501,8 @@ def parse_standard_zim(xfa_text: str, filename: str) -> dict:
         'ansprechpartner_email': extract_value(r'<cg_VMS_AP_mail>([^<]+)', xfa_text),
     }
     
-    # Mitarbeiter (TODO: vollstaendige Implementierung)
+    # TODO: Mitarbeiter und APs fuer Standard-ZIM implementieren
     mitarbeiter = []
-    
-    # Arbeitspakete (TODO: vollstaendige Implementierung)
     arbeitspakete = []
     
     return {
@@ -182,149 +511,6 @@ def parse_standard_zim(xfa_text: str, filename: str) -> dict:
         'mitarbeiter': mitarbeiter,
         'arbeitspakete': arbeitspakete,
         'format': 'standard_zim'
-    }
-
-
-# ============================================
-# PARSER: DURCHFUEHRBARKEITSSTUDIE
-# ============================================
-
-def parse_durchfuehrbarkeitsstudie(xfa_text: str, filename: str) -> dict:
-    """Parser fuer Durchfuehrbarkeitsstudien (Antrag_DS)"""
-    
-    # Zeilenumbrueche normalisieren
-    text = xfa_text.replace('\n>', '>').replace('>\n', '>')
-    
-    # Projekt
-    projekt = {
-        'name': extract_value(r'<thema>([^<]+)', text),
-        'kurzname': '',
-        'fkz': '',
-        'start': '',
-        'ende': '',
-        'foerderquote': 50.0,  # DS hat feste 50%
-        'gesamtkosten': 0.0,
-        'zuwendung': 0.0,
-        'gesamt_pm': 0.0,
-        'gesamt_pk': extract_float(r'<sum_ges_pk>([^<]+)', text) or 
-                     extract_float(r'<ges_pk>([^<]+)', text),
-        'laufzeit_monate': 0
-    }
-    
-    # Kurzfassung als Kurzname (erste 100 Zeichen)
-    kurzfass = extract_value(r'<kurzfass>([^<]+)', text)
-    if kurzfass:
-        projekt['kurzname'] = kurzfass[:100] + '...' if len(kurzfass) > 100 else kurzfass
-    
-    # Antragsteller
-    antragsteller = {
-        'firma': '',
-        'rechtsform': extract_value(r'<Rechtsform>([^<]+)', text),
-        'strasse': extract_value(r'<str>([^<]+)', text),
-        'plz': extract_value(r'<plz>([^<]+)', text),
-        'ort': extract_value(r'<ort>([^<]+)', text) or extract_value(r'<pfach_ort>([^<]+)', text),
-        'bundesland': extract_value(r'<ddl_land>([^<]+)', text),
-        'website': extract_value(r'<www>([^<]+)', text),
-        'ansprechpartner_name': '',
-        'ansprechpartner_funktion': '',
-        'ansprechpartner_telefon': extract_value(r'<tel_ap>([^<]+)', text) or 
-                                   extract_value(r'<tel_gf>([^<]+)', text),
-        'ansprechpartner_email': extract_value(r'<mail_ap>([^<]+)', text) or 
-                                 extract_value(r'<mail_gf>([^<]+)', text),
-    }
-    
-    # Firma aus Website oder Email ableiten
-    if antragsteller['website']:
-        domain = antragsteller['website'].replace('www.', '').split('.')[0]
-        antragsteller['firma'] = domain.capitalize() + ' GmbH'
-    elif antragsteller['ansprechpartner_email']:
-        parts = antragsteller['ansprechpartner_email'].split('@')
-        if len(parts) > 1:
-            domain = parts[1].split('.')[0]
-            antragsteller['firma'] = domain.capitalize() + ' GmbH'
-    
-    # Arbeitspakete - Nicht-technische APs
-    arbeitspakete = []
-    
-    ap_nrs = extract_all_values('Arbeitspaket_Nr', text)
-    ap_names = extract_all_values('Arbeitspaket', text)
-    ap_pms = extract_all_values('pm', text)
-    
-    print(f"  Nicht-techn. APs: {len(ap_nrs)} Nr, {len(ap_names)} Namen, {len(ap_pms)} PM")
-    
-    for i in range(max(len(ap_nrs), len(ap_names))):
-        ap_nr_str = ap_nrs[i] if i < len(ap_nrs) else str(i + 1)
-        ap_name = ap_names[i] if i < len(ap_names) else ''
-        pm_str = ap_pms[i] if i < len(ap_pms) else '0'
-        
-        if ap_name and len(ap_name) > 2:
-            haupt, unter = parse_ap_nummer(ap_nr_str)
-            if haupt == 0:
-                haupt = i + 1
-            
-            pm = parse_float_value(pm_str)
-            
-            arbeitspakete.append({
-                'ap_nummer': haupt,
-                'ap_code': f'AP{ap_nr_str}',
-                'name': ap_name,
-                'start_monat': None,
-                'ende_monat': None,
-                'gesamt_pm': pm,
-                'mitarbeiter_zuordnungen': []
-            })
-            
-            projekt['gesamt_pm'] += pm
-    
-    # Arbeitspakete - Technische APs
-    ap_nrs_tech = extract_all_values('Arbeitspaket_Nr_techn', text)
-    ap_names_tech = extract_all_values('Arbeitspaket_techn', text)
-    ap_pms_tech = extract_all_values('pm_techn', text)
-    
-    print(f"  Technische APs: {len(ap_nrs_tech)} Nr, {len(ap_names_tech)} Namen, {len(ap_pms_tech)} PM")
-    
-    for i in range(max(len(ap_nrs_tech), len(ap_names_tech))):
-        ap_nr_str = ap_nrs_tech[i] if i < len(ap_nrs_tech) else ''
-        ap_name = ap_names_tech[i] if i < len(ap_names_tech) else ''
-        pm_str = ap_pms_tech[i] if i < len(ap_pms_tech) else '0'
-        
-        if ap_name and len(ap_name) > 2 and ap_nr_str:
-            clean_nr = ap_nr_str.rstrip('.')
-            haupt, unter = parse_ap_nummer(clean_nr)
-            
-            # Pruefe ob AP schon existiert
-            exists = any(
-                ap['ap_nummer'] == haupt and ap['ap_code'] == f'AP{clean_nr}'
-                for ap in arbeitspakete
-            )
-            
-            if not exists and haupt > 0:
-                pm = parse_float_value(pm_str)
-                
-                arbeitspakete.append({
-                    'ap_nummer': haupt,
-                    'ap_code': f'AP{clean_nr}',
-                    'name': ap_name,
-                    'start_monat': None,
-                    'ende_monat': None,
-                    'gesamt_pm': pm,
-                    'mitarbeiter_zuordnungen': []
-                })
-                
-                projekt['gesamt_pm'] += pm
-    
-    # Sortieren
-    arbeitspakete.sort(key=lambda ap: (ap['ap_nummer'], ap['ap_code']))
-    
-    # DS hat normalerweise keine detaillierten Mitarbeiter-Daten
-    mitarbeiter = []
-    
-    return {
-        'projekt': projekt,
-        'antragsteller': antragsteller,
-        'mitarbeiter': mitarbeiter,
-        'arbeitspakete': arbeitspakete,
-        'format': 'durchfuehrbarkeitsstudie'
     }
 
 
@@ -384,7 +570,6 @@ def parse_zim_pdf(pdf_content: bytes, filename: str) -> dict:
         elif pdf_format == 'standard_zim':
             result = parse_standard_zim(xfa_text, filename)
         else:
-            # Versuche beide Parser
             print("Unbekanntes Format - versuche DS-Parser...")
             result = parse_durchfuehrbarkeitsstudie(xfa_text, filename)
             if not result['projekt']['name'] and not result['arbeitspakete']:
@@ -431,7 +616,6 @@ def parse_zim_pdf(pdf_content: bytes, filename: str) -> dict:
         }
         
     finally:
-        # Temporaere Datei loeschen
         import os
         try:
             os.unlink(tmp_path)
@@ -447,22 +631,24 @@ def parse_zim_pdf(pdf_content: bytes, filename: str) -> dict:
 async def root():
     return {
         "service": "ZIM PDF Parser",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "online",
         "endpoints": {
             "/parse": "POST - PDF hochladen und parsen",
             "/health": "GET - Health Check"
         },
-        "supported_formats": [
+        "features": [
             "Standard ZIM (Einzelprojekt, Kooperation)",
-            "Durchfuehrbarkeitsstudie (Antrag_DS)"
+            "Durchfuehrbarkeitsstudie (Antrag_DS)",
+            "Mitarbeiter-Extraktion (Anlage 6.1)",
+            "MA-Zuordnungen zu Arbeitspaketen"
         ]
     }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "3.0.0"}
+    return {"status": "healthy", "version": "3.1.0"}
 
 
 @app.post("/parse")
@@ -473,6 +659,12 @@ async def parse_pdf(file: UploadFile = File(...)):
     Unterstuetzte Formate:
     - Standard ZIM (Einzelprojekt, Kooperationsprojekt)
     - Durchfuehrbarkeitsstudie (Antrag_DS)
+    
+    Extrahierte Daten:
+    - Projekt-Stammdaten
+    - Antragsteller
+    - Mitarbeiter (aus Anlage 6.1)
+    - Arbeitspakete mit MA-Zuordnungen
     """
     
     if not file.filename.lower().endswith('.pdf'):
@@ -480,13 +672,22 @@ async def parse_pdf(file: UploadFile = File(...)):
     
     try:
         content = await file.read()
-        print(f"\n=== ZIM Parser v3.0 ===")
-        print(f"Datei: {file.filename}, Groesse: {len(content)} bytes")
+        print(f"\n{'='*50}")
+        print(f"ZIM Parser v3.1")
+        print(f"{'='*50}")
+        print(f"Datei: {file.filename}")
+        print(f"Groesse: {len(content)} bytes")
         
         result = parse_zim_pdf(content, file.filename)
         
-        print(f"Erfolgreich! Projekt: {result['projekt']['name'][:50]}..." if result['projekt']['name'] else "Projekt: (kein Name)")
-        print(f"APs: {result['statistik']['anzahl_arbeitspakete']}, PM: {result['statistik']['gesamt_pm']}")
+        print(f"\n{'='*50}")
+        print(f"ERGEBNIS:")
+        print(f"  Projekt: {result['projekt']['name'][:50]}..." if result['projekt']['name'] else "  Projekt: (kein Name)")
+        print(f"  Mitarbeiter: {result['statistik']['anzahl_mitarbeiter']}")
+        print(f"  Arbeitspakete: {result['statistik']['anzahl_arbeitspakete']}")
+        print(f"  MA-Zuordnungen: {result['statistik']['anzahl_ap_zuordnungen']}")
+        print(f"  Gesamt-PM: {result['statistik']['gesamt_pm']}")
+        print(f"{'='*50}\n")
         
         return JSONResponse(content={
             "success": True,
